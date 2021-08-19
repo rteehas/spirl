@@ -4,6 +4,7 @@ from spirl.rl.components.agent import BaseAgent
 from spirl.utils.general_utils import ParamDict, map_dict, AttrDict
 from spirl.utils.pytorch_utils import ten2ar, avg_grad_norm, TensorModule, check_shape, map2torch, map2np
 from spirl.rl.utils.mpi import sync_networks
+import copy
 
 
 class HER_Agent(SACAgent):
@@ -27,11 +28,41 @@ class HER_Agent(SACAgent):
             'clip_q_target': False,  # if True, clips Q target
             'target_entropy': None,  # target value for automatic entropy tuning, if None uses -action_dim
             'regularization': 0.001,
+            'her_iters': 100,
         })
         return super()._default_hparams().overwrite(default_dict)
 
     def update(self, experience_batch):
         self.add_experience(experience_batch)
+
+        T = self.replay_buffer.size
+
+        for ep in self.her_iters:
+            goal = self.sample_goal() # to impl
+            for _ in range(T):
+                filter = list(range(_))
+                her_batch = self._sample_experience(filter)
+                her_batch = self._normalize_batch(her_batch)
+                her_batch = map2torch(her_batch, self._hp.device)
+                her_batch = self._preprocess_experience(her_batch)
+
+                rewards = self.get_gc_rewards(her_batch)
+                obs_cat = self._concat(her_batch.observations, goal)
+                goal_cat = self._concat(her_batch.next, goal)
+                new_trans = AttrDict(observations=obs_cat, actions=her_batch.actions, rewards=rewards, next=goal_cat)
+                self.add_experience(new_trans)
+
+                goals = self.her_sample_experience(filter).actions
+
+                batch = copy.deepcopy(her_batch)
+                batch.next = goals
+
+                rewards = self.get_gc_rewards(batch)
+                obs_cat = self._concat(batch.observations, goals)
+                goals_cat = self._concat(her_batch.next, goal)
+                new_trans = AttrDict(observations=obs_cat, actions=batch.actions, rewards=rewards, next=goals_cat)
+                self.add_experience(new_trans)
+
 
         for _ in range(self._hp.update_iterations):
             # sample batch and normalize
@@ -98,3 +129,12 @@ class HER_Agent(SACAgent):
             info = map_dict(ten2ar, info)
 
         return info
+
+    def her_sample_experience(self, filter):
+        return self.replay_buffer.sample(n_samples=self._hp.batch_size, filter=filter)
+
+    def _concat(self, obs, goal):
+        return torch.cat([obs, goal], 1)
+
+    def get_gc_rewards(self, batch):
+        pass
